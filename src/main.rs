@@ -49,14 +49,20 @@ const HOMELAB_DNS_ANNOTATION: &str = "k8s.r0ssd.co/dns-entry";
 /// The label we use configure services with an additional finalizer so we can remove DNS records
 const HOMELAB_DNS_FINALIZER: &str = "homelab-dns.k8s.r0ssd.co/cleanup";
 
+/// Implement a custom error type to propagate errors through our controller implementation.
+/// NOTE(rossdylan): I would have just used anyhow, but kube-rs needs a `std::error::Error`
+/// compatible error type as the result from reconcile
 #[derive(thiserror::Error, Debug)]
 enum HLDError {
+    /// Errors returned from the trust-dns protocol library
     #[error("dns name conversion failure")]
     ProtoError(#[from] trust_dns_proto::error::ProtoError),
 
+    /// An error we kick back when we can't find the namespace of an object
     #[error("no namespace found in object")]
     NoNamespace,
 
+    /// A pass through for kube-rs errors
     #[error("kube-rs failure")]
     KubeError(#[from] kube::Error),
 
@@ -367,6 +373,8 @@ async fn reconcile_cleanup(
     Ok(Action::await_change())
 }
 
+/// This function is called when we get a new annotated service and we need to update our
+/// DNS records.
 async fn reconcile_apply(
     service: Arc<Service>,
     ctx: Context<ReconcilerState>,
