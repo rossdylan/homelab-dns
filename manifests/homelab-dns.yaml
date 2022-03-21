@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app: homelab-dns
+  name: controller
+  namespace: homelab-dns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app: homelab-dns
+  name: homelab-dns:controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app: homelab-dns
+  name: homelab-dns:controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: homelab-dns:controller
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: homelab-dns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  labels:
+    app: homelab-dns
+    component: controller
+  namespace: homelab-dns
+spec:
+  selector:
+    matchLabels:
+      app: homelab-dns
+      component: controller
+  template:
+    metadata:
+      labels:
+        app: homelab-dns
+        component: controller
+    spec:
+      serviceAccount: controller
+      containers:
+        - name: controller
+          image: homelab-dns:latest
+          imagePullPolicy: Never
+          args:
+            - /usr/src/app/homelab-dns
+            - --bind=0.0.0.0:5053
+            - --origin=k8s.internal
+          resources:
+            limits:
+              memory: "128M"
+              cpu: "500m"
+          ports:
+            - containerPort: 5053
+              name: dns-tcp
+              protocol: TCP
+            - containerPort: 5053
+              name: dns-udp
+              protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-dns-tcp
+  namespace: homelab-dns
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "homelab-dns"
+spec:
+  selector:
+    app: homelab-dns
+    component: controller
+  ports:
+    - port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+  type: LoadBalancer
+  loadBalancerIP: 10.2.1.2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-dns-udp
+  namespace: homelab-dns
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "homelab-dns"
+spec:
+  selector:
+    app: homelab-dns
+    component: controller
+  ports:
+    - port: 53
+      protocol: UDP
+      targetPort: dns-udp
+  type: LoadBalancer
+  loadBalancerIP: 10.2.1.2

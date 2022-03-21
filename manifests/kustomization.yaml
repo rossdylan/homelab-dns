@@ -1,0 +1,3 @@
+resources:
+  - homelab-dns.yaml
+  - namespace.yaml

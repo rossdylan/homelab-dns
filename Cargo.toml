@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Ross Delinger <rossdylan@fastmail.com>"]
 readme = "README.md"
-description = "External-ish DNS for homelab kubernetes cluster"
+description = "External-ish DNS for homelab kubernetes clusters"
 license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
