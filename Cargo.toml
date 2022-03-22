@@ -24,3 +24,7 @@ tracing-subscriber = "0.3"
 trust-dns-client = "0.21.1"
 trust-dns-proto = "0.21.1"
 trust-dns-server = { version = "0.21.1", default-features = false }
+
+[profile.release]
+debug = 1
+incremental = true

@@ -20,6 +20,8 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::error::{Error as HLDError, Result as HLDResult};
+
 use anyhow::anyhow;
 use clap::Parser;
 use futures::StreamExt;
@@ -30,7 +32,7 @@ use kube::api::{Patch, PatchParams};
 use kube::runtime::finalizer;
 use kube::{
     runtime::controller::{Action, Context, Controller},
-    runtime::finalizer::{Error as FinalizerError, Event},
+    runtime::finalizer::Event,
     Api, Client, Resource, ResourceExt,
 };
 use tokio::net::{TcpListener, UdpSocket};
@@ -42,73 +44,14 @@ use trust_dns_server::authority::{AuthorityObject, Catalog, ZoneType};
 use trust_dns_server::store::in_memory::InMemoryAuthority;
 use trust_dns_server::ServerFuture;
 
+mod error;
+
 /// The name of the annotation we use to mark our LoadBalancer objects with the domain name they
 /// should be associated with
 const HOMELAB_DNS_ANNOTATION: &str = "k8s.r0ssd.co/dns-entry";
 
 /// The label we use configure services with an additional finalizer so we can remove DNS records
 const HOMELAB_DNS_FINALIZER: &str = "homelab-dns.k8s.r0ssd.co/cleanup";
-
-/// Implement a custom error type to propagate errors through our controller implementation.
-/// NOTE(rossdylan): I would have just used anyhow, but kube-rs needs a `std::error::Error`
-/// compatible error type as the result from reconcile
-#[derive(thiserror::Error, Debug)]
-enum HLDError {
-    /// Errors returned from the trust-dns protocol library
-    #[error("dns name conversion failure")]
-    ProtoError(#[from] trust_dns_proto::error::ProtoError),
-
-    /// An error we kick back when we can't find the namespace of an object
-    #[error("no namespace found in object")]
-    NoNamespace,
-
-    /// A pass through for kube-rs errors
-    #[error("kube-rs failure")]
-    KubeError(#[from] kube::Error),
-
-    #[error("finalizer failed to apply")]
-    FinalizerApplyFailed {
-        #[source]
-        source: Box<HLDError>,
-    },
-    #[error("finalizer cleanup failed")]
-    FinalizerCleanupFailed {
-        #[source]
-        source: Box<HLDError>,
-    },
-    #[error("failed to add finalizer")]
-    FinalizerAddFailed {
-        #[source]
-        source: kube::Error,
-    },
-    #[error("failed to add finalizer")]
-    FinalizerRemoveFailed {
-        #[source]
-        source: kube::Error,
-    },
-    #[error("unnamed object")]
-    FinalizerUnnamedObject,
-}
-
-impl From<FinalizerError<Self>> for HLDError {
-    fn from(error: FinalizerError<Self>) -> Self {
-        match error {
-            FinalizerError::ApplyFailed(inner) => HLDError::FinalizerApplyFailed {
-                source: Box::new(inner),
-            },
-            FinalizerError::CleanupFailed(inner) => HLDError::FinalizerCleanupFailed {
-                source: Box::new(inner),
-            },
-            FinalizerError::AddFinalizer(inner) => HLDError::FinalizerAddFailed { source: inner },
-            FinalizerError::RemoveFinalizer(inner) => {
-                HLDError::FinalizerRemoveFailed { source: inner }
-            }
-            FinalizerError::UnnamedObject => HLDError::FinalizerUnnamedObject,
-        }
-    }
-}
-
-type HLDResult<T, E = HLDError> = std::result::Result<T, E>;
 
 /// External-ish DNS for homelab kubernetes clusters
 #[derive(Parser, Debug, Clone)]
@@ -132,29 +75,28 @@ struct Args {
 }
 
 /// Try and extract the IP addresses from the load balancer status
+/// NOTE(rossdylan): I had this as a fairly deeply nested set of if let statements
+/// previously. I rewrote it using optional chaining. I think? its better? maybe?
 fn get_lb_ips(srv: &Service) -> Option<Vec<String>> {
-    if let Some(status) = &srv.status {
-        if let Some(lb) = &status.load_balancer {
-            if let Some(ingress) = &lb.ingress {
-                let ips: Vec<String> = ingress
-                    .iter()
-                    .filter(|lbi| lbi.ip.is_some())
-                    .map(|lbi| lbi.ip.as_ref().unwrap().clone())
-                    .collect();
-                return Some(ips);
-            }
-        }
-    }
-    None
+    srv.status
+        .as_ref()
+        .and_then(|s| s.load_balancer.as_ref())
+        .and_then(|lb| lb.ingress.as_ref())
+        .map(|i| {
+            i.iter()
+                .filter(|lbi| lbi.ip.is_some())
+                .map(|lbi| lbi.ip.as_ref().unwrap().clone())
+                .collect()
+        })
 }
 
 /// Extract the annotation used to specify what domain name we should register for this LoadBalancer
 fn get_hld_annotation(srv: &Service) -> Option<String> {
-    if let Some(annotations) = &srv.metadata.annotations {
-        annotations.get(HOMELAB_DNS_ANNOTATION).map(Clone::clone)
-    } else {
-        None
-    }
+    srv.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(HOMELAB_DNS_ANNOTATION))
+        .map(Clone::clone)
 }
 
 /// Create our initial records. Right now this is just the SOA record but eventually this will
@@ -252,7 +194,11 @@ async fn reconcile(service: Arc<Service>, ctx: Context<ReconcilerState>) -> HLDR
     } else {
         false
     };
-    let lb_name = service.metadata.name.as_deref().unwrap_or("???");
+    let lb_name = service
+        .metadata
+        .name
+        .as_deref()
+        .ok_or(HLDError::FinalizerUnnamedObject)?;
     if !is_lb {
         debug!(
             "ignoring service {} because it is not a LoadBlanacer",
@@ -335,6 +281,9 @@ async fn reconcile_early_cleanup(
     Ok(Action::await_change())
 }
 
+/// This reconcile function is called when our kube-rs managed finalizer has its cleanup triggered.
+/// This is the happy fully managed path and kube-rs handles the full finalizer lifecycle (as opposed
+/// to the early-cleanup case where we have to manually remove the finalizer ourselves)
 async fn reconcile_cleanup(
     service: Arc<Service>,
     ctx: Context<ReconcilerState>,
@@ -408,11 +357,6 @@ async fn reconcile_apply(
                     "added record for service {}: {} -> {}",
                     lb_name, name, parsed_addr
                 );
-            } else {
-                info!(
-                    "failed to add record for service {}: {} -> {}",
-                    lb_name, name, parsed_addr
-                );
             }
         }
     }
@@ -420,6 +364,7 @@ async fn reconcile_apply(
     Ok(Action::requeue(Duration::from_secs(3600)))
 }
 
+/// This is called when our reconciler errors. For now all it does is log
 fn error_policy(error: &HLDError, _ctx: Context<ReconcilerState>) -> Action {
     error!("reconciliation failed: {}", error);
     Action::requeue(Duration::from_secs(5))
@@ -431,10 +376,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt::init();
 
+    // TODO(rossdylan): we should preload our DNS server with state scraped from the k8s api.
+    // This way on cold boot we don't have a period of time where we don't have any records.
+    // That period is short, as we immediately start the reconcile loop and load all records
+    // but lets aim for perfection.
     let authority = spawn_server(&args).await?;
 
-    // This part is all trust-dns-server configuration
-    // All the kube reflector shit is below this point
     let client = Client::try_default().await?;
     let services: Api<Service> = Api::all(client.clone());
 
