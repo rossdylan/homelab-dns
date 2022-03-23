@@ -1,0 +1,27 @@
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: cimg/rust:1.59.0
+    steps:
+      - checkout
+      - run: cargo --version
+      - run:
+          name: Configure rust
+          command: |
+            #!/bin/bash
+            set -eux
+            rustflags=(
+                    	"-C link-arg=-Wl,--compress-debug-sections=zlib"
+                    	"-C force-frame-pointers=yes"
+                    )
+
+                    cat \<< EOF >> "${BASH_ENV}"
+                    	export CARGO_INCREMENTAL="0"
+                    	export CARGO_PROFILE_RELEASE_LTO="thin"
+                    	export RUSTFLAGS="${rustflags[*]}"
+                    EOF
+      - run:
+          name: Build
+          command: cargo build --release
