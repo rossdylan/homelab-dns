@@ -1,15 +1,39 @@
 # homelab-dns
-Dead simple authoritative DNS server for mapping a custom "external"
-domain to a kubernetes LoadBalancer. Designed to be used with metallb
-and ubiquiti edgerouters
+[![CircleCI](https://circleci.com/gh/rossdylan/homelab-dns/tree/main.svg?style=shield)](https://circleci.com/gh/rossdylan/homelab-dns/tree/main)
 
-```
-rossdylan@cyrene ~/src/homelab-dns main! ○ ./target/debug/homelab-dns --bind 127.0.0.1:5053 --origin k8s.internal
-2022-03-20T04:16:45.902048Z  INFO homelab_dns: added record for service grafana: grafana.k8s.internal -> 10.2.1.1
-2022-03-20T04:17:02.237860Z  INFO trust_dns_server::server::server_future: request:29789 src:UDP://127.0.0.1#38027 QUERY:grafana.k8s.internal.:A:IN qflags:RD,AD response:NoError rr:1/0/0 rflags:RD,AA
-```
+Simple authoritative DNS server for mapping a custom "external"
+domain to a kubernetes LoadBalancer. Designed to be used with metallb.
 
+
+## Notes On Homelab Setup
+homelab-dns is designed explicitly with metallb and ubiquiti devices in mind.
+The code itself is fairly agnostic, relying mostly on k8s built in objects.
+The problem comes with the provided deployment manifests which are built explicitly for metallb.
+
+## Edgerouter Configuration
+
+1. Open Config Tree
+2. Navigate to `service > dns > forwarding`
+3. Setup DNS forwarding (if not already)
+4. Under options click Add
+5. Enter `server=/<your-selected-origin>/<external-ip-for-homelab-dns>`
+
+## Usage
 ```
-rossdylan@cyrene ~/src/homelab-dns master! ○ dig @127.0.0.1 -p 5053 grafana.k8s.internal +short
-10.2.1.1
+$ homelab-dns -h
+homelab-dns 0.1
+Ross Delinger <rossdylan@fastmail.com>
+External-ish DNS for homelab kubernetes clusters
+
+USAGE:
+    homelab-dns [OPTIONS] --origin <ORIGIN>
+
+OPTIONS:
+    -b, --bind <BIND>                  Address and port to bind our DNS server on [default:
+                                       127.0.0.1:53]
+    -h, --help                         Print help information
+    -o, --origin <ORIGIN>              The root domain we are serving DNS for
+    -t, --ttl <TTL>                    Set the TTL of the LoadBalancer DNS records [default: 300]
+        --tcp-timeout <TCP_TIMEOUT>    Timeout for DNS over TCP connections [default: 1s]
+    -V, --version                      Print version information
 ```
