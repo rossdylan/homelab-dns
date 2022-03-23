@@ -1,16 +1,19 @@
-FROM rust:buster as builder
+FROM rust:bullseye as builder
 
+RUN apt-get update && apt-get install -y lld
+# First we build just our dependencies so they are cacheable
 WORKDIR /usr/src
 RUN USER=root cargo new --bin homelab-dns
 WORKDIR /usr/src/homelab-dns
 COPY Cargo.toml Cargo.lock ./
-RUN cargo build --release
+RUN CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_LTO=thin RUSTFLAGS="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--compress-debug-sections=zlib -C force-frame-pointers=yes" cargo build --release
 RUN rm -rf src
+# Now we build our actual application
 COPY src ./src
 RUN touch src/main.rs
-RUN cargo build --release
+RUN CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_LTO=thin RUSTFLAGS="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--compress-debug-sections=zlib -C force-frame-pointers=yes" cargo build --release
 
-FROM debian:buster-slim
+FROM debian:bullseye-slim
 ARG APP=/usr/src/app
 # We bloat our package a bit by adding dnsutils, but we are running a DNS server so
 # having it around is useful

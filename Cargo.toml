@@ -28,3 +28,4 @@ trust-dns-server = { version = "0.21.1", default-features = false }
 [profile.release]
 debug = 1
 incremental = true
+lto = "off"
