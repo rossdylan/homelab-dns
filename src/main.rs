@@ -31,7 +31,7 @@ use k8s_openapi::api::core::v1::Service;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::finalizer;
 use kube::{
-    runtime::controller::{Action, Context, Controller},
+    runtime::controller::{Action, Controller},
     runtime::finalizer::Event,
     Api, Client, Resource, ResourceExt,
 };
@@ -186,7 +186,7 @@ impl ReconcilerState {
 /// Run a single instance of our reconciliation loop. We check to see if the changed service is one we
 /// should care about, then use the kube-rs finalizer support to either apply new updates to our
 /// authoritative zone, or remove the relevant records.
-async fn reconcile(service: Arc<Service>, ctx: Context<ReconcilerState>) -> HLDResult<Action> {
+async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResult<Action> {
     // The first thing we do is check to see if we care about this Service.
     // This way we don't attach finalizers to all services
     let is_lb = if let Some(spec) = &service.spec {
@@ -206,15 +206,14 @@ async fn reconcile(service: Arc<Service>, ctx: Context<ReconcilerState>) -> HLDR
         );
         return Ok(Action::requeue(Duration::from_secs(3600)));
     }
-    let state = ctx.get_ref();
     let anno = get_hld_annotation(&service);
-    let previous_anno = state.domain_for_service(lb_name);
+    let previous_anno = ctx.domain_for_service(lb_name);
     let ns = service
         .meta()
         .namespace
         .as_deref()
         .ok_or(HLDError::NoNamespace)?;
-    let sapi: Api<Service> = Api::namespaced(ctx.get_ref().kube.clone(), ns);
+    let sapi: Api<Service> = Api::namespaced(ctx.kube.clone(), ns);
 
     if anno.is_none() && previous_anno.is_none() {
         debug!(
@@ -242,7 +241,7 @@ async fn reconcile(service: Arc<Service>, ctx: Context<ReconcilerState>) -> HLDR
 async fn reconcile_early_cleanup(
     sapi: Api<Service>,
     service: Arc<Service>,
-    ctx: Context<ReconcilerState>,
+    ctx: Arc<ReconcilerState>,
 ) -> HLDResult<Action> {
     reconcile_cleanup(service.clone(), ctx).await?;
     let finalizer_index = &service
@@ -286,14 +285,13 @@ async fn reconcile_early_cleanup(
 /// to the early-cleanup case where we have to manually remove the finalizer ourselves)
 async fn reconcile_cleanup(
     service: Arc<Service>,
-    ctx: Context<ReconcilerState>,
+    ctx: Arc<ReconcilerState>,
 ) -> HLDResult<Action> {
-    let state = ctx.get_ref();
-    let mut records = state.authority.records_mut().await;
+    let mut records = ctx.authority.records_mut().await;
 
     let lb_name = service.metadata.name.as_deref().unwrap_or("???");
     // Grab the domain name from the current annotation, or the last value we observed
-    let anno = get_hld_annotation(&service).or_else(|| state.domain_for_service(lb_name));
+    let anno = get_hld_annotation(&service).or_else(|| ctx.domain_for_service(lb_name));
     if anno.is_none() {
         debug!(
             "ignoring service {} because it is not marked with '{}'",
@@ -318,7 +316,7 @@ async fn reconcile_cleanup(
             aaaa_records.records_without_rrsigs()
         );
     }
-    state.remove_domain_for_service(lb_name);
+    ctx.remove_domain_for_service(lb_name);
     Ok(Action::await_change())
 }
 
@@ -326,9 +324,8 @@ async fn reconcile_cleanup(
 /// DNS records.
 async fn reconcile_apply(
     service: Arc<Service>,
-    ctx: Context<ReconcilerState>,
+    ctx: Arc<ReconcilerState>,
 ) -> HLDResult<Action> {
-    let state = ctx.get_ref();
     let anno = get_hld_annotation(&service).unwrap();
     let lb_name = service.metadata.name.as_deref().unwrap_or("???");
     let name = Name::from_str(&anno)?;
@@ -348,9 +345,9 @@ async fn reconcile_apply(
                 IpAddr::V4(v4) => RData::A(v4),
                 IpAddr::V6(v6) => RData::AAAA(v6),
             };
-            let success = state
+            let success = ctx
                 .authority
-                .upsert(Record::from_rdata(name.clone(), state.args.ttl, rdata), 0)
+                .upsert(Record::from_rdata(name.clone(), ctx.args.ttl, rdata), 0)
                 .await;
             if success {
                 info!(
@@ -360,12 +357,12 @@ async fn reconcile_apply(
             }
         }
     }
-    state.set_domain_for_service(lb_name, &anno);
+    ctx.set_domain_for_service(lb_name, &anno);
     Ok(Action::requeue(Duration::from_secs(3600)))
 }
 
 /// This is called when our reconciler errors. For now all it does is log
-fn error_policy(error: &HLDError, _ctx: Context<ReconcilerState>) -> Action {
+fn error_policy(error: &HLDError, _ctx: Arc<ReconcilerState>) -> Action {
     error!("reconciliation failed: {}", error);
     Action::requeue(Duration::from_secs(5))
 }
@@ -387,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = ReconcilerState::new(authority, args, client);
     Controller::new(services, Default::default())
-        .run(reconcile, error_policy, Context::new(state))
+        .run(reconcile, error_policy, Arc::new(state))
         .for_each(|_| futures::future::ready(()))
         .await;
     Ok(())
