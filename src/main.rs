@@ -14,7 +14,7 @@
     unreachable_pub
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -33,9 +33,11 @@ use kube::runtime::finalizer;
 use kube::{
     runtime::controller::{Action, Controller},
     runtime::finalizer::Event,
+    runtime::events::{Reporter, Recorder, Event as REvent, EventType},
     Api, Client, Resource, ResourceExt,
 };
 use tokio::net::{TcpListener, UdpSocket};
+use tracing::log::warn;
 use tracing::{debug, error, info};
 use trust_dns_client::rr::{LowerName, RrKey};
 use trust_dns_proto::rr::rdata::soa::SOA;
@@ -49,6 +51,7 @@ mod error;
 /// The name of the annotation we use to mark our LoadBalancer objects with the domain name they
 /// should be associated with
 const HOMELAB_DNS_ANNOTATION: &str = "k8s.r0ssd.co/dns-entry";
+const HOMELAB_DNS_CNAME_ANNOTATION: &str = "k8s.r0ssd.co/cname-entry";
 
 /// The label we use configure services with an additional finalizer so we can remove DNS records
 const HOMELAB_DNS_FINALIZER: &str = "homelab-dns.k8s.r0ssd.co/cleanup";
@@ -90,13 +93,34 @@ fn get_lb_ips(srv: &Service) -> Option<Vec<String>> {
         })
 }
 
+/// A struct containing the A and CNAME records from the service annotation
+#[derive(Clone, Debug)]
+struct AnnotationEntries {
+    a_record: String,
+    cnames: Vec<String>
+}
+
 /// Extract the annotation used to specify what domain name we should register for this LoadBalancer
-fn get_hld_annotation(srv: &Service) -> Option<String> {
-    srv.metadata
+fn get_hld_annotation(srv: &Service) -> Option<AnnotationEntries> {
+    let maybe_a = srv.metadata
         .annotations
         .as_ref()
         .and_then(|a| a.get(HOMELAB_DNS_ANNOTATION))
-        .map(Clone::clone)
+        .map(Clone::clone);
+    let cnames = srv.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(HOMELAB_DNS_CNAME_ANNOTATION))
+        .map(|ca| ca.split(",").map(ToOwned::to_owned).collect::<Vec<String>>())
+        .unwrap_or(Vec::with_capacity(0));
+    if let Some(a) = maybe_a {
+        Some(AnnotationEntries{
+            a_record: a,
+            cnames,
+        })
+    } else {
+        None
+    }
 }
 
 /// Create our initial records. Right now this is just the SOA record but eventually this will
@@ -148,7 +172,8 @@ async fn spawn_server(args: &Args) -> anyhow::Result<Arc<InMemoryAuthority>> {
 /// DNS authority and general application configuration used to create new entries.
 struct ReconcilerState {
     authority: Arc<InMemoryAuthority>,
-    service_to_domain: Arc<Mutex<HashMap<String, String>>>,
+    service_to_domain: Arc<Mutex<HashMap<String, AnnotationEntries>>>,
+    reporter: Reporter,
     kube: Client,
     args: Args,
 }
@@ -158,12 +183,16 @@ impl ReconcilerState {
         ReconcilerState {
             authority,
             service_to_domain: Arc::new(Mutex::new(HashMap::new())),
+            reporter: Reporter {
+                controller: "homelab-dns".into(),
+                instance: std::env::var("POD_NAME").ok(),
+            },
             kube,
             args,
         }
     }
 
-    fn domain_for_service(&self, service: &str) -> Option<String> {
+    fn domain_for_service(&self, service: &str) -> Option<AnnotationEntries> {
         self.service_to_domain
             .lock()
             .unwrap()
@@ -175,11 +204,11 @@ impl ReconcilerState {
         self.service_to_domain.lock().unwrap().remove(service);
     }
 
-    fn set_domain_for_service(&self, service: &str, domain: &str) {
+    fn set_domain_for_service(&self, service: &str, entries: &AnnotationEntries) {
         self.service_to_domain
             .lock()
             .unwrap()
-            .insert(service.into(), domain.into());
+            .insert(service.into(), entries.clone());
     }
 }
 
@@ -206,6 +235,8 @@ async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResul
         );
         return Ok(Action::requeue(Duration::from_secs(3600)));
     }
+
+
     let anno = get_hld_annotation(&service);
     let previous_anno = ctx.domain_for_service(lb_name);
     let ns = service
@@ -222,28 +253,47 @@ async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResul
         );
         return Ok(Action::requeue(Duration::from_secs(3600)));
     }
+    let recorder = Recorder::new(ctx.kube.clone(), ctx.reporter.clone(), service.object_ref(&()));
+
     // Handle our early termination case where something has removed the annotation from a service but not deleted it completely
     if anno.is_none() && previous_anno.is_some() {
-        return reconcile_early_cleanup(sapi, service, ctx).await;
+        return reconcile_early_cleanup(&recorder, sapi, service, ctx).await;
     }
 
-    let action = finalizer(&sapi, HOMELAB_DNS_FINALIZER, service, |event| async {
+    let action_res = finalizer(&sapi, HOMELAB_DNS_FINALIZER, service, |event| async {
         match event {
-            Event::Apply(svc) => reconcile_apply(svc, ctx).await,
-            Event::Cleanup(svc) => reconcile_cleanup(svc, ctx).await,
+            Event::Apply(svc) => reconcile_apply(&recorder, svc, ctx).await,
+            Event::Cleanup(svc) => reconcile_cleanup(&recorder, svc, ctx).await,
         }
     })
-    .await?;
-    Ok(action)
+    .await;
+    // Log an error event ot kube
+    match action_res {
+        Err(e) => {
+            let event = REvent{
+                type_: EventType::Warning,
+                action: "error".into(),
+                reason: "dnsUpdate".into(),
+                note: Some(format!("failed to update dns: {}", e)),
+                secondary: None,
+            };
+            if let Err(e) = recorder.publish(event).await {
+                warn!("failed to publish svc event to k8s: {}", e);
+            }
+            Err(e.into())
+        },
+        Ok(a) => Ok(a),
+    }
 }
 
 /// This cleanup helper is used to remove DNS entries when something has removed the homelab-dns annotation from a service
 async fn reconcile_early_cleanup(
+    recorder: &Recorder,
     sapi: Api<Service>,
     service: Arc<Service>,
     ctx: Arc<ReconcilerState>,
 ) -> HLDResult<Action> {
-    reconcile_cleanup(service.clone(), ctx).await?;
+    reconcile_cleanup(recorder, service.clone(), ctx).await?;
     let finalizer_index = &service
         .finalizers()
         .iter()
@@ -284,6 +334,7 @@ async fn reconcile_early_cleanup(
 /// This is the happy fully managed path and kube-rs handles the full finalizer lifecycle (as opposed
 /// to the early-cleanup case where we have to manually remove the finalizer ourselves)
 async fn reconcile_cleanup(
+    recorder: &Recorder,
     service: Arc<Service>,
     ctx: Arc<ReconcilerState>,
 ) -> HLDResult<Action> {
@@ -299,18 +350,62 @@ async fn reconcile_cleanup(
         );
         return Ok(Action::await_change());
     }
+    let aentries = anno.unwrap();
+    // Do CNAMEs first to avoid orphaning them
+    for cname in aentries.cnames {
+        let name  = Name::from_str(&cname)?;
 
-    let name = Name::from_str(&anno.unwrap())?;
+        let key = RrKey::new(LowerName::new(&name), RecordType::CNAME);
+        if let Some(records) = records.remove(&key) {
+            let event = REvent {
+                action: "remove".into(),
+                reason: "dnsUpdate".into(),
+                note: Some(format!("removing dns record '{}'", cname)),
+                type_: EventType::Normal,
+                secondary: None,
+            };
+            if let Err(e) = recorder.publish(event).await {
+                warn!("failed to publish svc event to k8s: {}", e);
+            }
+            info!(
+                "removing CNAME records {:?}",
+                records.records_without_rrsigs()
+            );
+        }
+
+    }
+    // Now remove the backing A/AAAA records
+    let name  = Name::from_str(&aentries.a_record)?;
 
     let a_key = RrKey::new(LowerName::new(&name), RecordType::A);
     let aaaa_key = RrKey::new(LowerName::new(&name), RecordType::AAAA);
     if let Some(a_records) = records.remove(&a_key) {
+        let event = REvent {
+            action: "remove".into(),
+            reason: "dnsUpdate".into(),
+            note: Some(format!("removing dns record '{}'", name)),
+            type_: EventType::Normal,
+            secondary: None,
+        };
+        if let Err(e) = recorder.publish(event).await {
+            warn!("failed to publish svc event to k8s: {}", e);
+        }
         info!(
             "removing A records {:?}",
             a_records.records_without_rrsigs()
         );
     }
     if let Some(aaaa_records) = records.remove(&aaaa_key) {
+        let event = REvent {
+            action: "remove".into(),
+            reason: "dnsUpdate".into(),
+            note: Some(format!("removing dns record '{}'", name)),
+            type_: EventType::Normal,
+            secondary: None,
+        };
+        if let Err(e) = recorder.publish(event).await {
+            warn!("failed to publish svc event to k8s: {}", e);
+        }
         info!(
             "removing AAAA records {:?}",
             aaaa_records.records_without_rrsigs()
@@ -323,12 +418,16 @@ async fn reconcile_cleanup(
 /// This function is called when we get a new annotated service and we need to update our
 /// DNS records.
 async fn reconcile_apply(
+    recorder: &Recorder,
     service: Arc<Service>,
     ctx: Arc<ReconcilerState>,
 ) -> HLDResult<Action> {
     let anno = get_hld_annotation(&service).unwrap();
     let lb_name = service.metadata.name.as_deref().unwrap_or("???");
-    let name = Name::from_str(&anno)?;
+    let prev_anno = ctx.domain_for_service(lb_name);
+
+    // Set up our A records first
+    let name = Name::from_str(&anno.a_record)?;
 
     if let Some(addrs) = get_lb_ips(&service) {
         // TODO(rossdylan): We don't handle the case where the assigned addresses have been changed.
@@ -350,11 +449,73 @@ async fn reconcile_apply(
                 .upsert(Record::from_rdata(name.clone(), ctx.args.ttl, rdata), 0)
                 .await;
             if success {
+                let event = REvent {
+                    action: "add".into(),
+                    reason: "dnsUpdate".into(),
+                    note: Some(format!("adding dns record mapping '{}' to '{}'", name, parsed_addr)),
+                    type_: EventType::Normal,
+                    secondary: None,
+                };
+                if let Err(e) = recorder.publish(event).await {
+                    warn!("failed to publish svc event to k8s: {}", e);
+                }
                 info!(
                     "added record for service {}: {} -> {}",
                     lb_name, name, parsed_addr
                 );
             }
+        }
+    }
+
+    let prev_cnames: HashSet<&str> = if let Some(ref prev) = prev_anno {
+        prev.cnames.iter().map(AsRef::as_ref).collect()
+    } else {
+        HashSet::new()
+    };
+    let cur_cnames: HashSet<&str> = anno.cnames.iter().map(AsRef::as_ref).collect();
+
+    // things to add is the set of names in cur but not in prev
+    for cname in cur_cnames.difference(&prev_cnames) {
+        let parsed_cname = Name::from_str(cname)?;
+        let rdata = RData::CNAME(name.clone());
+        let success = ctx
+            .authority
+            .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
+            .await;
+        if success {
+            let event = REvent {
+                action: "add".into(),
+                reason: "dnsUpdate".into(),
+                note: Some(format!("adding dns record mapping '{}' to '{}'", parsed_cname, name)),
+                type_: EventType::Normal,
+                secondary: None,
+            };
+            if let Err(e) = recorder.publish(event).await {
+                warn!("failed to publish svc event to k8s: {}", e);
+            }
+            info!("added cname for service {}: {} -> {}", lb_name, parsed_cname, name);
+        }
+    }
+    // things to remove is the set of names in prev but not in cur
+    for cname in prev_cnames.difference(&cur_cnames) {
+        let parsed_cname = Name::from_str(cname)?;
+        let mut records = ctx.authority.records_mut().await;
+        let key = RrKey::new(LowerName::new(&parsed_cname), RecordType::CNAME);
+        if let Some(records) = records.remove(&key) {
+            let event = REvent {
+                action: "remove".into(),
+                reason: "dnsUpdate".into(),
+                note: Some(format!("removing dns record '{}'", cname)),
+                type_: EventType::Normal,
+                secondary: None,
+            };
+            if let Err(e) = recorder.publish(event).await {
+                warn!("failed to publish svc event to k8s: {}", e);
+            }
+            info!(
+                "removing CNAME records {:?}",
+                records.records_without_rrsigs()
+            );
         }
     }
     ctx.set_domain_for_service(lb_name, &anno);

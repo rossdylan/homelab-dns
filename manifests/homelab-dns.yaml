@@ -23,6 +23,13 @@ rules:
       - watch
       - update
       - patch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -61,7 +68,7 @@ spec:
       serviceAccount: controller
       containers:
         - name: controller
-          image: homelab-dns:latest
+          image: rossdylan/homelab-dns:latest
           imagePullPolicy: Never
           args:
             - /usr/src/app/homelab-dns
