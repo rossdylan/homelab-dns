@@ -30,6 +30,13 @@ rules:
     verbs:
       - create
       - patch
+  - apiGroups:
+      - "events.k8s.io"
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -69,11 +76,16 @@ spec:
       containers:
         - name: controller
           image: rossdylan/homelab-dns:latest
-          imagePullPolicy: Never
+          imagePullPolicy: Always
           args:
             - /usr/src/app/homelab-dns
             - --bind=0.0.0.0:5053
             - --origin=k8s.internal
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           resources:
             limits:
               memory: "128M"
