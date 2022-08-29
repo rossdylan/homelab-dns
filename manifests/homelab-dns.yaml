@@ -79,6 +79,7 @@ spec:
           imagePullPolicy: Always
           args:
             - /usr/src/app/homelab-dns
+            - -a
             - --bind=0.0.0.0:5053
             - --origin=k8s.internal
           env:

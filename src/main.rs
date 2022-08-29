@@ -75,6 +75,12 @@ struct Args {
     /// Set the TTL of the LoadBalancer DNS records
     #[clap(short, long, default_value_t = 300)]
     ttl: u32,
+
+    /// Do not use CNAME records for cnames but instead make A records to the
+    /// underlying IP. This is a compatability option due to some resolvers
+    /// assuming they are talking to a recursive resolver.
+    #[clap(short, long)]
+    a_for_cnames: bool,
 }
 
 /// Try and extract the IP addresses from the load balancer status
@@ -355,7 +361,11 @@ async fn reconcile_cleanup(
     for cname in aentries.cnames {
         let name  = Name::from_str(&cname)?;
 
-        let key = RrKey::new(LowerName::new(&name), RecordType::CNAME);
+        let key = if ctx.args.a_for_cnames {
+            RrKey::new(LowerName::new(&name), RecordType::A)
+        } else {
+            RrKey::new(LowerName::new(&name), RecordType::CNAME)
+        };
         if let Some(records) = records.remove(&key) {
             let event = REvent {
                 action: "remove".into(),
@@ -429,41 +439,34 @@ async fn reconcile_apply(
     // Set up our A records first
     let name = Name::from_str(&anno.a_record)?;
 
-    if let Some(addrs) = get_lb_ips(&service) {
-        // TODO(rossdylan): We don't handle the case where the assigned addresses have been changed.
-        // This will require some deeper twiddling of the authority database to remove old records
-        for addr in addrs {
-            let parsed_addr = match addr.parse::<IpAddr>() {
-                Err(e) => {
-                    error!("failed to parse IP Address for service {}: {}", lb_name, e);
-                    continue;
-                }
-                Ok(pa) => pa,
+    let addrs = get_lb_ips(&service).unwrap_or(vec![]);
+    let parsed: Vec<IpAddr> = addrs.iter().flat_map(|s| s.parse().ok()).collect();
+    // TODO(rossdylan): We don't handle the case where the assigned addresses have been changed.
+    // This will require some deeper twiddling of the authority database to remove old records
+    for addr in parsed.iter() {
+        let rdata = match addr {
+            IpAddr::V4(v4) => RData::A(*v4),
+            IpAddr::V6(v6) => RData::AAAA(*v6),
+        };
+        let success = ctx
+            .authority
+            .upsert(Record::from_rdata(name.clone(), ctx.args.ttl, rdata), 0)
+            .await;
+        if success {
+            let event = REvent {
+                action: "add".into(),
+                reason: "dnsUpdate".into(),
+                note: Some(format!("adding dns record mapping '{}' to '{}'", name, addr)),
+                type_: EventType::Normal,
+                secondary: None,
             };
-            let rdata = match parsed_addr {
-                IpAddr::V4(v4) => RData::A(v4),
-                IpAddr::V6(v6) => RData::AAAA(v6),
-            };
-            let success = ctx
-                .authority
-                .upsert(Record::from_rdata(name.clone(), ctx.args.ttl, rdata), 0)
-                .await;
-            if success {
-                let event = REvent {
-                    action: "add".into(),
-                    reason: "dnsUpdate".into(),
-                    note: Some(format!("adding dns record mapping '{}' to '{}'", name, parsed_addr)),
-                    type_: EventType::Normal,
-                    secondary: None,
-                };
-                if let Err(e) = recorder.publish(event).await {
-                    warn!("failed to publish svc event to k8s: {}", e);
-                }
-                info!(
-                    "added record for service {}: {} -> {}",
-                    lb_name, name, parsed_addr
-                );
+            if let Err(e) = recorder.publish(event).await {
+                warn!("failed to publish svc event to k8s: {}", e);
             }
+            info!(
+                "added record for service {}: {} -> {}",
+                lb_name, name, addr
+            );
         }
     }
 
@@ -477,11 +480,26 @@ async fn reconcile_apply(
     // things to add is the set of names in cur but not in prev
     for cname in cur_cnames.difference(&prev_cnames) {
         let parsed_cname = Name::from_str(cname)?;
-        let rdata = RData::CNAME(name.clone());
-        let success = ctx
-            .authority
-            .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
-            .await;
+        let success = if ctx.args.a_for_cnames {
+            if let Some(pa) = parsed.first() {
+                let rdata = match pa {
+                    IpAddr::V4(v4) => RData::A(*v4),
+                    IpAddr::V6(v6) => RData::AAAA(*v6),
+                };
+                ctx
+                    .authority
+                    .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
+                    .await
+            } else {
+                false
+            }
+        } else {
+            let rdata = RData::CNAME(name.clone());
+            ctx
+                .authority
+                .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
+                .await
+        };
         if success {
             let event = REvent {
                 action: "add".into(),
@@ -500,7 +518,11 @@ async fn reconcile_apply(
     for cname in prev_cnames.difference(&cur_cnames) {
         let parsed_cname = Name::from_str(cname)?;
         let mut records = ctx.authority.records_mut().await;
-        let key = RrKey::new(LowerName::new(&parsed_cname), RecordType::CNAME);
+        let key = if ctx.args.a_for_cnames {
+            RrKey::new(LowerName::new(&parsed_cname), RecordType::A)
+        } else {
+            RrKey::new(LowerName::new(&parsed_cname), RecordType::CNAME)
+        };
         if let Some(records) = records.remove(&key) {
             let event = REvent {
                 action: "remove".into(),
