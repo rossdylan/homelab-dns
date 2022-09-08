@@ -51,7 +51,7 @@ mod error;
 /// The name of the annotation we use to mark our LoadBalancer objects with the domain name they
 /// should be associated with
 const HOMELAB_DNS_ANNOTATION: &str = "k8s.r0ssd.co/dns-entry";
-const HOMELAB_DNS_CNAME_ANNOTATION: &str = "k8s.r0ssd.co/cname-entry";
+const HOMELAB_DNS_ANAME_ANNOTATION: &str = "k8s.r0ssd.co/cname-entry";
 
 /// The label we use configure services with an additional finalizer so we can remove DNS records
 const HOMELAB_DNS_FINALIZER: &str = "homelab-dns.k8s.r0ssd.co/cleanup";
@@ -75,12 +75,6 @@ struct Args {
     /// Set the TTL of the LoadBalancer DNS records
     #[clap(short, long, default_value_t = 300)]
     ttl: u32,
-
-    /// Do not use CNAME records for cnames but instead make A records to the
-    /// underlying IP. This is a compatability option due to some resolvers
-    /// assuming they are talking to a recursive resolver.
-    #[clap(short, long)]
-    a_for_cnames: bool,
 }
 
 /// Try and extract the IP addresses from the load balancer status
@@ -99,11 +93,11 @@ fn get_lb_ips(srv: &Service) -> Option<Vec<String>> {
         })
 }
 
-/// A struct containing the A and CNAME records from the service annotation
+/// A struct containing the A and ANAME records from the service annotation
 #[derive(Clone, Debug)]
 struct AnnotationEntries {
     a_record: String,
-    cnames: Vec<String>
+    anames: Vec<String>
 }
 
 /// Extract the annotation used to specify what domain name we should register for this LoadBalancer
@@ -113,16 +107,16 @@ fn get_hld_annotation(srv: &Service) -> Option<AnnotationEntries> {
         .as_ref()
         .and_then(|a| a.get(HOMELAB_DNS_ANNOTATION))
         .map(Clone::clone);
-    let cnames = srv.metadata
+    let anames = srv.metadata
         .annotations
         .as_ref()
-        .and_then(|a| a.get(HOMELAB_DNS_CNAME_ANNOTATION))
+        .and_then(|a| a.get(HOMELAB_DNS_ANAME_ANNOTATION))
         .map(|ca| ca.split(",").map(ToOwned::to_owned).collect::<Vec<String>>())
         .unwrap_or(Vec::with_capacity(0));
     if let Some(a) = maybe_a {
         Some(AnnotationEntries{
             a_record: a,
-            cnames,
+            anames,
         })
     } else {
         None
@@ -148,6 +142,10 @@ fn generate_initial_records(origin: &Name) -> BTreeMap<RrKey, RecordSet> {
     );
     rr.add_rdata(RData::SOA(soa));
     map.insert(RrKey::new(LowerName::new(origin), RecordType::SOA), rr);
+
+    let mut rr = RecordSet::new(origin, RecordType::NS, 0);
+    rr.add_rdata(RData::NS(Name::from_str("localhost").unwrap()));
+    map.insert(RrKey::new(LowerName::new(origin), RecordType::NS), rr);
     map
 }
 
@@ -357,15 +355,11 @@ async fn reconcile_cleanup(
         return Ok(Action::await_change());
     }
     let aentries = anno.unwrap();
-    // Do CNAMEs first to avoid orphaning them
-    for cname in aentries.cnames {
+    // Do ANAMEs first to avoid orphaning them
+    for cname in aentries.anames {
         let name  = Name::from_str(&cname)?;
 
-        let key = if ctx.args.a_for_cnames {
-            RrKey::new(LowerName::new(&name), RecordType::A)
-        } else {
-            RrKey::new(LowerName::new(&name), RecordType::CNAME)
-        };
+        let key = RrKey::new(LowerName::new(&name), RecordType::ANAME);
         if let Some(records) = records.remove(&key) {
             let event = REvent {
                 action: "remove".into(),
@@ -378,7 +372,7 @@ async fn reconcile_cleanup(
                 warn!("failed to publish svc event to k8s: {}", e);
             }
             info!(
-                "removing CNAME records {:?}",
+                "removing ANAME records {:?}",
                 records.records_without_rrsigs()
             );
         }
@@ -471,35 +465,21 @@ async fn reconcile_apply(
     }
 
     let prev_cnames: HashSet<&str> = if let Some(ref prev) = prev_anno {
-        prev.cnames.iter().map(AsRef::as_ref).collect()
+        prev.anames.iter().map(AsRef::as_ref).collect()
     } else {
         HashSet::new()
     };
-    let cur_cnames: HashSet<&str> = anno.cnames.iter().map(AsRef::as_ref).collect();
+    let cur_cnames: HashSet<&str> = anno.anames.iter().map(AsRef::as_ref).collect();
 
     // things to add is the set of names in cur but not in prev
     for cname in cur_cnames.difference(&prev_cnames) {
         let parsed_cname = Name::from_str(cname)?;
-        let success = if ctx.args.a_for_cnames {
-            if let Some(pa) = parsed.first() {
-                let rdata = match pa {
-                    IpAddr::V4(v4) => RData::A(*v4),
-                    IpAddr::V6(v6) => RData::AAAA(*v6),
-                };
-                ctx
-                    .authority
-                    .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
-                    .await
-            } else {
-                false
-            }
-        } else {
-            let rdata = RData::CNAME(name.clone());
-            ctx
-                .authority
-                .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
-                .await
-        };
+        let rdata = RData::ANAME(name.clone());
+        let success = ctx
+            .authority
+            .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
+            .await;
+
         if success {
             let event = REvent {
                 action: "add".into(),
@@ -511,18 +491,14 @@ async fn reconcile_apply(
             if let Err(e) = recorder.publish(event).await {
                 warn!("failed to publish svc event to k8s: {}", e);
             }
-            info!("added cname for service {}: {} -> {}", lb_name, parsed_cname, name);
+            info!("added aname for service {}: {} -> {}", lb_name, parsed_cname, name);
         }
     }
     // things to remove is the set of names in prev but not in cur
     for cname in prev_cnames.difference(&cur_cnames) {
         let parsed_cname = Name::from_str(cname)?;
         let mut records = ctx.authority.records_mut().await;
-        let key = if ctx.args.a_for_cnames {
-            RrKey::new(LowerName::new(&parsed_cname), RecordType::A)
-        } else {
-            RrKey::new(LowerName::new(&parsed_cname), RecordType::CNAME)
-        };
+        let key = RrKey::new(LowerName::new(&parsed_cname), RecordType::ANAME);
         if let Some(records) = records.remove(&key) {
             let event = REvent {
                 action: "remove".into(),
@@ -535,7 +511,7 @@ async fn reconcile_apply(
                 warn!("failed to publish svc event to k8s: {}", e);
             }
             info!(
-                "removing CNAME records {:?}",
+                "removing ANAME records {:?}",
                 records.records_without_rrsigs()
             );
         }
