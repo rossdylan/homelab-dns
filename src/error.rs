@@ -6,7 +6,7 @@ use kube::runtime::finalizer::Error as FinalizerError;
 pub(crate) enum Error {
     /// Errors returned from the trust-dns protocol library
     #[error("dns name conversion failure")]
-    TrustDNSProto(#[from] trust_dns_proto::error::ProtoError),
+    HickoryDnsProto(#[from] hickory_proto::error::ProtoError),
 
     /// An error we kick back when we can't find the namespace of an object
     #[error("no namespace found in object")]
@@ -36,6 +36,8 @@ pub(crate) enum Error {
         #[source]
         source: kube::Error,
     },
+    #[error("invalid finalizer")]
+    InvalidFinalizer,
     #[error("unnamed object")]
     FinalizerUnnamedObject,
 }
@@ -52,6 +54,7 @@ impl From<FinalizerError<Self>> for Error {
             FinalizerError::AddFinalizer(inner) => Self::FinalizerAddFailed { source: inner },
             FinalizerError::RemoveFinalizer(inner) => Self::FinalizerRemoveFailed { source: inner },
             FinalizerError::UnnamedObject => Self::FinalizerUnnamedObject,
+            FinalizerError::InvalidFinalizer => Self::InvalidFinalizer,
         }
     }
 }

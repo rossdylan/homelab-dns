@@ -25,6 +25,11 @@ use crate::error::{Error as HLDError, Result as HLDResult};
 use anyhow::anyhow;
 use clap::Parser;
 use futures::StreamExt;
+use hickory_proto::rr::rdata::soa::SOA;
+use hickory_proto::rr::{LowerName, Name, RData, Record, RecordSet, RecordType, RrKey};
+use hickory_server::authority::{AuthorityObject, Catalog, ZoneType};
+use hickory_server::store::in_memory::InMemoryAuthority;
+use hickory_server::ServerFuture;
 use humantime::Duration as HumanDuration;
 use json_patch::{PatchOperation, RemoveOperation, TestOperation};
 use k8s_openapi::api::core::v1::Service;
@@ -32,19 +37,13 @@ use kube::api::{Patch, PatchParams};
 use kube::runtime::finalizer;
 use kube::{
     runtime::controller::{Action, Controller},
+    runtime::events::{Event as REvent, EventType, Recorder, Reporter},
     runtime::finalizer::Event,
-    runtime::events::{Reporter, Recorder, Event as REvent, EventType},
     Api, Client, Resource, ResourceExt,
 };
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::log::warn;
 use tracing::{debug, error, info};
-use trust_dns_client::rr::{LowerName, RrKey};
-use trust_dns_proto::rr::rdata::soa::SOA;
-use trust_dns_proto::rr::{Name, RData, Record, RecordSet, RecordType};
-use trust_dns_server::authority::{AuthorityObject, Catalog, ZoneType};
-use trust_dns_server::store::in_memory::InMemoryAuthority;
-use trust_dns_server::ServerFuture;
 
 mod error;
 
@@ -58,7 +57,7 @@ const HOMELAB_DNS_FINALIZER: &str = "homelab-dns.k8s.r0ssd.co/cleanup";
 
 /// External-ish DNS for homelab kubernetes clusters
 #[derive(Parser, Debug, Clone)]
-#[clap(author = "Ross Delinger <rossdylan@fastmail.com>", version = "0.1", about, long_about = None)]
+#[clap(author = "Ross Delinger <rossdylan@fastmail.com>", about, long_about = None)]
 struct Args {
     /// The root domain we are serving DNS for.
     #[clap(short, long)]
@@ -97,30 +96,32 @@ fn get_lb_ips(srv: &Service) -> Option<Vec<String>> {
 #[derive(Clone, Debug)]
 struct AnnotationEntries {
     a_record: String,
-    anames: Vec<String>
+    anames: Vec<String>,
 }
 
 /// Extract the annotation used to specify what domain name we should register for this LoadBalancer
 fn get_hld_annotation(srv: &Service) -> Option<AnnotationEntries> {
-    let maybe_a = srv.metadata
+    let maybe_a = srv
+        .metadata
         .annotations
         .as_ref()
         .and_then(|a| a.get(HOMELAB_DNS_ANNOTATION))
-        .map(Clone::clone);
-    let anames = srv.metadata
+        .cloned();
+    let anames = srv
+        .metadata
         .annotations
         .as_ref()
         .and_then(|a| a.get(HOMELAB_DNS_ANAME_ANNOTATION))
-        .map(|ca| ca.split(",").map(ToOwned::to_owned).collect::<Vec<String>>())
-        .unwrap_or(Vec::with_capacity(0));
-    if let Some(a) = maybe_a {
-        Some(AnnotationEntries{
-            a_record: a,
-            anames,
+        .map(|ca| {
+            ca.split(",")
+                .map(ToOwned::to_owned)
+                .collect::<Vec<String>>()
         })
-    } else {
-        None
-    }
+        .unwrap_or_default();
+    maybe_a.map(|ae| AnnotationEntries {
+        a_record: ae,
+        anames,
+    })
 }
 
 /// Create our initial records. Right now this is just the SOA record but eventually this will
@@ -144,7 +145,9 @@ fn generate_initial_records(origin: &Name) -> BTreeMap<RrKey, RecordSet> {
     map.insert(RrKey::new(LowerName::new(origin), RecordType::SOA), rr);
 
     let mut rr = RecordSet::new(origin, RecordType::NS, 0);
-    rr.add_rdata(RData::NS(Name::from_str("localhost").unwrap()));
+    rr.add_rdata(RData::NS(hickory_proto::rr::rdata::name::NS(
+        Name::from_str("localhost").unwrap(),
+    )));
     map.insert(RrKey::new(LowerName::new(origin), RecordType::NS), rr);
     map
 }
@@ -168,7 +171,7 @@ async fn spawn_server(args: &Args) -> anyhow::Result<Arc<InMemoryAuthority>> {
 
     server.register_socket(udp_sock);
     server.register_listener(tcp_listener, *args.tcp_timeout);
-    tokio::task::spawn(server.block_until_done());
+    tokio::task::spawn(async move { server.block_until_done().await });
     Ok(authority)
 }
 
@@ -197,11 +200,7 @@ impl ReconcilerState {
     }
 
     fn domain_for_service(&self, service: &str) -> Option<AnnotationEntries> {
-        self.service_to_domain
-            .lock()
-            .unwrap()
-            .get(service)
-            .map(Clone::clone)
+        self.service_to_domain.lock().unwrap().get(service).cloned()
     }
 
     fn remove_domain_for_service(&self, service: &str) {
@@ -240,7 +239,6 @@ async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResul
         return Ok(Action::requeue(Duration::from_secs(3600)));
     }
 
-
     let anno = get_hld_annotation(&service);
     let previous_anno = ctx.domain_for_service(lb_name);
     let ns = service
@@ -257,7 +255,11 @@ async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResul
         );
         return Ok(Action::requeue(Duration::from_secs(3600)));
     }
-    let recorder = Recorder::new(ctx.kube.clone(), ctx.reporter.clone(), service.object_ref(&()));
+    let recorder = Recorder::new(
+        ctx.kube.clone(),
+        ctx.reporter.clone(),
+        service.object_ref(&()),
+    );
 
     // Handle our early termination case where something has removed the annotation from a service but not deleted it completely
     if anno.is_none() && previous_anno.is_some() {
@@ -271,10 +273,10 @@ async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResul
         }
     })
     .await;
-    // Log an error event ot kube
+    // Log an error event to kube
     match action_res {
         Err(e) => {
-            let event = REvent{
+            let event = REvent {
                 type_: EventType::Warning,
                 action: "error".into(),
                 reason: "dnsUpdate".into(),
@@ -285,7 +287,7 @@ async fn reconcile(service: Arc<Service>, ctx: Arc<ReconcilerState>) -> HLDResul
                 warn!("failed to publish svc event to k8s: {}", e);
             }
             Err(e.into())
-        },
+        }
         Ok(a) => Ok(a),
     }
 }
@@ -320,11 +322,11 @@ async fn reconcile_early_cleanup(
                 // `Test` ensures that we fail instead of deleting someone else's finalizer
                 // (in which case a new `Cleanup` event will be sent)
                 PatchOperation::Test(TestOperation {
-                    path: finalizer_path.clone(),
+                    path: finalizer_path.clone().try_into().unwrap(),
                     value: HOMELAB_DNS_FINALIZER.into(),
                 }),
                 PatchOperation::Remove(RemoveOperation {
-                    path: finalizer_path,
+                    path: finalizer_path.try_into().unwrap(),
                 }),
             ])),
         )
@@ -357,7 +359,7 @@ async fn reconcile_cleanup(
     let aentries = anno.unwrap();
     // Do ANAMEs first to avoid orphaning them
     for cname in aentries.anames {
-        let name  = Name::from_str(&cname)?;
+        let name = Name::from_str(&cname)?;
 
         let key = RrKey::new(LowerName::new(&name), RecordType::ANAME);
         if let Some(records) = records.remove(&key) {
@@ -376,10 +378,9 @@ async fn reconcile_cleanup(
                 records.records_without_rrsigs()
             );
         }
-
     }
     // Now remove the backing A/AAAA records
-    let name  = Name::from_str(&aentries.a_record)?;
+    let name = Name::from_str(&aentries.a_record)?;
 
     let a_key = RrKey::new(LowerName::new(&name), RecordType::A);
     let aaaa_key = RrKey::new(LowerName::new(&name), RecordType::AAAA);
@@ -433,14 +434,14 @@ async fn reconcile_apply(
     // Set up our A records first
     let name = Name::from_str(&anno.a_record)?;
 
-    let addrs = get_lb_ips(&service).unwrap_or(vec![]);
+    let addrs = get_lb_ips(&service).unwrap_or_default();
     let parsed: Vec<IpAddr> = addrs.iter().flat_map(|s| s.parse().ok()).collect();
     // TODO(rossdylan): We don't handle the case where the assigned addresses have been changed.
     // This will require some deeper twiddling of the authority database to remove old records
     for addr in parsed.iter() {
         let rdata = match addr {
-            IpAddr::V4(v4) => RData::A(*v4),
-            IpAddr::V6(v6) => RData::AAAA(*v6),
+            IpAddr::V4(v4) => RData::A((*v4).into()),
+            IpAddr::V6(v6) => RData::AAAA((*v6).into()),
         };
         let success = ctx
             .authority
@@ -450,17 +451,17 @@ async fn reconcile_apply(
             let event = REvent {
                 action: "add".into(),
                 reason: "dnsUpdate".into(),
-                note: Some(format!("adding dns record mapping '{}' to '{}'", name, addr)),
+                note: Some(format!(
+                    "adding dns record mapping '{}' to '{}'",
+                    name, addr
+                )),
                 type_: EventType::Normal,
                 secondary: None,
             };
             if let Err(e) = recorder.publish(event).await {
                 warn!("failed to publish svc event to k8s: {}", e);
             }
-            info!(
-                "added record for service {}: {} -> {}",
-                lb_name, name, addr
-            );
+            info!("added record for service {}: {} -> {}", lb_name, name, addr);
         }
     }
 
@@ -474,24 +475,33 @@ async fn reconcile_apply(
     // things to add is the set of names in cur but not in prev
     for cname in cur_cnames.difference(&prev_cnames) {
         let parsed_cname = Name::from_str(cname)?;
-        let rdata = RData::ANAME(name.clone());
+        let rdata = RData::ANAME(hickory_proto::rr::rdata::ANAME(name.clone()));
         let success = ctx
             .authority
-            .upsert(Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata), 0)
+            .upsert(
+                Record::from_rdata(parsed_cname.clone(), ctx.args.ttl, rdata),
+                0,
+            )
             .await;
 
         if success {
             let event = REvent {
                 action: "add".into(),
                 reason: "dnsUpdate".into(),
-                note: Some(format!("adding dns record mapping '{}' to '{}'", parsed_cname, name)),
+                note: Some(format!(
+                    "adding dns record mapping '{}' to '{}'",
+                    parsed_cname, name
+                )),
                 type_: EventType::Normal,
                 secondary: None,
             };
             if let Err(e) = recorder.publish(event).await {
                 warn!("failed to publish svc event to k8s: {}", e);
             }
-            info!("added aname for service {}: {} -> {}", lb_name, parsed_cname, name);
+            info!(
+                "added aname for service {}: {} -> {}",
+                lb_name, parsed_cname, name
+            );
         }
     }
     // things to remove is the set of names in prev but not in cur
@@ -521,7 +531,7 @@ async fn reconcile_apply(
 }
 
 /// This is called when our reconciler errors. For now all it does is log
-fn error_policy(error: &HLDError, _ctx: Arc<ReconcilerState>) -> Action {
+fn error_policy(_services: Arc<Service>, error: &HLDError, _ctx: Arc<ReconcilerState>) -> Action {
     error!("reconciliation failed: {}", error);
     Action::requeue(Duration::from_secs(5))
 }
